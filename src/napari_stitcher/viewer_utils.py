@@ -86,10 +86,7 @@ def image_layer_to_msim(l, viewer):
         for isim, ldata in enumerate(l.data):
 
             # convert to SpatialImage if necessary
-            if not isinstance(ldata, xr.DataArray):
-                # need to implement downsampling logic for this
-                raise(NotImplementedError('Multiscale layers with non-xarray data not supported yet.'))
-            else:
+            if isinstance(ldata, xr.DataArray):
                 sdims = spatial_image_utils.get_spatial_dims_from_sim(ldata)
 
                 ldata = ldata.assign_coords({'c': str(ldata.coords['c'].values)})
@@ -100,6 +97,34 @@ def image_layer_to_msim(l, viewer):
                     translation={dim: t for dim, t in zip(sdims, l.translate[-len(sdims):])},
                     dims=ldata.dims,
                 )
+            else:
+                # Handle raw arrays (e.g., dask arrays) at different scales
+                dims = get_layer_dims(l, viewer)
+                sdims = [dim for dim in dims if dim in ['x', 'y', 'z']]
+                
+                # Convert to dask array if needed
+                data = ldata
+                if not isinstance(data, da.Array):
+                    data = da.from_array(data)
+                
+                # Add time dimension if not present
+                if 't' not in dims:
+                    dims = ['t'] + dims
+                    data = data[np.newaxis]
+                
+                # Create SpatialImage with proper scale and translation
+                sim = to_spatial_image(
+                    data,
+                    scale={dim: s for dim, s in zip(sdims, l.scale[-len(sdims):])},
+                    translation={dim: t for dim, t in zip(sdims, l.translate[-len(sdims):])},
+                    dims=dims,
+                )
+                
+                # Assign channel coordinate from layer name
+                if len(l.name.split(' :: ')) > 1:
+                    sim = sim.assign_coords(c=l.name.split(' :: ')[-1])
+                else:
+                    sim = sim.assign_coords(c='default_channel')
 
             data_objects['scale%s' %isim] = sim.to_dataset(name='image', promote_attrs=True)
         msim = xr.DataTree.from_dict(data_objects)
