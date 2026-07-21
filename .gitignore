@@ -85,3 +85,6 @@ venv/
 
 src/napari_stitcher/_playground
 doc_old
+_playground
+
+uv.lock

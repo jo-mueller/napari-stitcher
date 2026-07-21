@@ -1,5 +1,6 @@
 import os
 import numpy as np
+from unittest.mock import patch
 from pathlib import Path
 import tempfile
 import tifffile
@@ -10,7 +11,8 @@ from napari_stitcher import (
     viewer_utils,
 )
 
-from multiview_stitcher import msi_utils, registration, mv_graph, spatial_image_utils
+from multiview_stitcher import (
+    misc_utils, msi_utils, mv_graph, spatial_image_utils)
 from multiview_stitcher.io import METADATA_TRANSFORM_KEY
 from multiview_stitcher.sample_data import (
     get_mosaic_sample_data_path, generate_tiled_dataset)
@@ -36,9 +38,7 @@ def test_data_loading_while_plugin_open(make_napari_viewer):
 
 
 
-# make_napari_viewer is a pytest fixture that returns a napari viewer object
-# capsys is a pytest fixture that captures stdout and stderr output streams
-def test_stitcher_q_widget_integrated(make_napari_viewer, capsys):
+def test_stitcher_q_widget_integrated(make_napari_viewer):
     """
     Integration test covering typical pipeline.
     """
@@ -74,7 +74,7 @@ def test_stitcher_q_widget_integrated(make_napari_viewer, capsys):
     stitcher_widget.visualization_type_rbuttons.value=_stitcher_widget.CHOICE_REGISTERED
 
     # Make sure view 0 is shifted now
-    assert ~np.allclose(
+    assert not np.allclose(
         np.eye(ndim + 1),
         viewer.layers[1].affine.affine_matrix[-(ndim+1):, -(ndim+1):])
 
@@ -434,3 +434,158 @@ def test_manual_transform_show_original_no_msim_update(make_napari_viewer):
     assert np.allclose(
         np.array(updated_metadata), np.array(original_metadata)
     ), "affine_metadata should NOT be updated live when showing Original"
+
+
+@pytest.mark.parametrize("all_multiscale", [True, False])
+def test_fusion_output_scale_matches_input(all_multiscale, make_napari_viewer):
+    """
+    Fused result is multiscale (>1 resolution levels) iff all input layers
+    are multiscale; a single non-multiscale input collapses the output to
+    a single resolution level.
+    """
+    viewer = make_napari_viewer()
+    wdg = StitcherQWidget(viewer)
+    viewer.window.add_dock_widget(wdg)
+
+    if all_multiscale:
+        sims = generate_tiled_dataset(
+            ndim=2, N_t=1, N_c=1, tile_size=30,
+            tiles_x=2, tiles_y=1, tiles_z=1, overlap=5, zoom=10, dtype=np.uint8)
+        msims = [msi_utils.get_msim_from_sim(sim, scale_factors=[2]) for sim in sims]
+        layer_tuples = viewer_utils.create_image_layer_tuples_from_msims(
+            msims, transform_key=METADATA_TRANSFORM_KEY)
+        for lt in layer_tuples:
+            viewer.add_image(lt[0], **lt[1])
+    else:
+        # Plain numpy arrays; l.multiscale is False for these layers
+        D = 100
+        arr = np.random.randint(0, 255, (D, D), dtype=np.uint8)
+        viewer.add_image(arr[:, :D//2+D//10], translate=(0, 0), name='im1')
+        viewer.add_image(arr[:, D//2-D//10:], translate=(0, D//2-D//10), name='im2')
+
+    wdg.button_load_layers_all.clicked()
+    assert wdg.all_layers_multiscale == all_multiscale
+
+    wdg.run_fusion()
+    fused_layer = wdg.fused_layers[-1]
+    # Fused layer is multiscale iff all inputs were multiscale
+    assert fused_layer.multiscale == all_multiscale
+
+
+@pytest.mark.parametrize("precompute", [True, False])
+def test_precompute_fusion(precompute, make_napari_viewer):
+    """
+    When Pre-compute fusion is enabled the result is written to a temporary
+    zarr store before the layer is created; when disabled no disk write occurs
+    and the layer is backed by a lazy dask graph.
+    """
+    viewer = make_napari_viewer()
+    wdg = StitcherQWidget(viewer)
+    viewer.window.add_dock_widget(wdg)
+
+    D = 100
+    arr = np.random.randint(0, 255, (D, D), dtype=np.uint8)
+    viewer.add_image(arr[:, :D//2+D//10], translate=(0, 0), name='im1')
+    viewer.add_image(arr[:, D//2-D//10:], translate=(0, D//2-D//10), name='im2')
+
+    wdg.button_load_layers_all.clicked()
+    wdg.precompute_fusion_n_jobs.value = 1
+    wdg.precompute_fusion.value = precompute
+    assert wdg.precompute_fusion_path.mode.value == 'd'
+    assert wdg.precompute_fusion_path.enabled == precompute
+    assert wdg.precompute_fusion_n_jobs.enabled == precompute
+    wdg.run_fusion()
+
+    zarr_written = any(name.endswith('.zarr') for name in os.listdir(wdg.tmpdir.name))
+    assert zarr_written == precompute
+
+
+def test_precompute_fusion_uses_custom_path(tmp_path, make_napari_viewer):
+    """
+    User-selected fusion paths are the top-level pre-computed zarr stores.
+    """
+    viewer = make_napari_viewer()
+    wdg = StitcherQWidget(viewer)
+    viewer.window.add_dock_widget(wdg)
+
+    D = 100
+    arr = np.random.randint(0, 255, (D, D), dtype=np.uint8)
+    viewer.add_image(arr[:, :D//2+D//10], translate=(0, 0), name='im1')
+    viewer.add_image(arr[:, D//2-D//10:], translate=(0, D//2-D//10), name='im2')
+
+    wdg.button_load_layers_all.clicked()
+    wdg.precompute_fusion_n_jobs.value = 1
+    output_path = tmp_path / 'custom_fusion.zarr'
+    wdg.precompute_fusion_path.value = output_path
+    wdg.run_fusion()
+
+    assert output_path.exists()
+    assert not any(name.endswith('.zarr') for name in os.listdir(wdg.tmpdir.name))
+
+
+def test_precompute_fusion_job_options(make_napari_viewer):
+    """
+    Pre-computed fusion uses joblib with batches scaled to the job count.
+    """
+    viewer = make_napari_viewer()
+    wdg = StitcherQWidget(viewer)
+
+    assert wdg.precompute_fusion_n_jobs.value == (os.cpu_count() or 1)
+
+    n_jobs = min(3, int(wdg.precompute_fusion_n_jobs.max))
+    wdg.precompute_fusion_n_jobs.value = n_jobs
+    batch_options = wdg._get_precompute_fusion_batch_options()
+
+    assert batch_options['batch_func'] is misc_utils.process_batch_using_joblib
+    assert batch_options['n_batch'] == 5 * n_jobs
+    assert batch_options['batch_func_kwargs']['n_jobs'] == n_jobs
+
+
+@pytest.mark.parametrize("use_layer_res", [True, False])
+def test_use_layer_resolution(use_layer_res, make_napari_viewer):
+    """
+    When 'Use layer resolution' is enabled, registration receives single-scale
+    msims at the layer's current data_level.  When disabled it receives the
+    full multiscale msims (> 1 scale level).
+    """
+    import multiview_stitcher.registration as mv_reg
+
+    viewer = make_napari_viewer()
+    wdg = StitcherQWidget(viewer)
+    viewer.window.add_dock_widget(wdg)
+
+    sims = generate_tiled_dataset(
+        ndim=2, N_t=1, N_c=1, tile_size=30,
+        tiles_x=2, tiles_y=1, tiles_z=1, overlap=5, zoom=10, dtype=np.uint8)
+    msims = [msi_utils.get_msim_from_sim(sim, scale_factors=[2]) for sim in sims]
+    for lt in viewer_utils.create_image_layer_tuples_from_msims(
+            msims, transform_key=METADATA_TRANSFORM_KEY):
+        viewer.add_image(lt[0], **lt[1])
+
+    wdg.button_load_layers_all.clicked()
+
+    # Lock level 0 (finest) on every multiscale layer, simulating the user
+    # choosing a specific resolution in napari's layer controls (not Auto)
+    for l in wdg.input_layers:
+        if l.multiscale:
+            l.locked_data_level = 0
+
+    wdg.use_layer_resolution.value = use_layer_res
+
+    captured = []
+    real_register = mv_reg.register
+
+    def capturing_register(msims_arg, **kwargs):
+        captured.extend(msims_arg)
+        return real_register(msims_arg, **kwargs)
+
+    with patch.object(mv_reg, 'register', side_effect=capturing_register):
+        wdg.run_registration()
+
+    n_scales = [len(msi_utils.get_sorted_scale_keys(m)) for m in captured]
+    if use_layer_res:
+        assert all(n == 1 for n in n_scales), \
+            f"expected single-scale reg inputs, got {n_scales}"
+    else:
+        assert all(n > 1 for n in n_scales), \
+            f"expected multiscale reg inputs, got {n_scales}"

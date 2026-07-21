@@ -26,9 +26,10 @@ classifiers = [
 requires-python = ">=3.11"
 dependencies = [
     "dask",
+    "joblib",
     "magicgui",
     "multiscale_spatial_image",
-    "multiview-stitcher[czi, itk-elastix] >=0.1.49",
+    "multiview-stitcher[czi,itk-elastix]>=0.1.59",
     "napari",
     "numpy >=1.18",
     "qtpy",
@@ -48,19 +49,23 @@ dynamic = ["version"]
 [project.optional-dependencies]
 testing_no_gui = [
     "tox",
-    "multiview-stitcher[czi] >=0.1.47",
     "pytest",
     "pytest-cov",
     "pytest-qt",
+    "napari-ome-zarr",
 ]
 testing = [
     "tox",
-    "multiview-stitcher[czi] >=0.1.47",
     "pytest",
     "pytest-cov",
     "pytest-qt",
     "napari",
     "pyqt5",
+    "napari-ome-zarr",
+]
+playground = [
+    "napari[all]",
+    "napari-ome-zarr",
 ]
 
 [project.entry-points."napari.manifest"]

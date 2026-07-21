@@ -3,22 +3,24 @@ import xarray as xr
 import dask.array as da
 from dask import compute
 from functools import partial
-import warnings
 
-from spatial_image import to_spatial_image
-import multiscale_spatial_image as msi
-from multiscale_spatial_image import to_multiscale
+from multiview_stitcher import (
+    mv_graph,
+    spatial_image_utils,
+    msi_utils,
+    param_utils,
+)
 
-from multiview_stitcher import mv_graph, spatial_image_utils, msi_utils, param_utils
+from . import _utils
 
 from napari.experimental import link_layers
 from napari.utils import notifications
 
 
-def get_layer_dims(l,viewer):
+def get_layer_dims(l, viewer):
     """
     Get the dimensions of a napari layer.
-    
+
     Parameters
     ----------
     l : napari.layers.Image
@@ -32,10 +34,10 @@ def get_layer_dims(l,viewer):
         List of dimensions of the layer
     """
 
-    ldata = l.data
-    
+    ldata = l.data[0] if l.multiscale else l.data
+
     if isinstance(ldata, xr.DataArray):
-        dims = ldata.dims
+        dims = list(ldata.dims)
 
     # infer dimensions for images loaded with napari-aicsimageio
     elif 'aicsimage' in l.metadata:
@@ -43,11 +45,11 @@ def get_layer_dims(l,viewer):
         xim = xim.squeeze()
         dims = [dim.lower() for dim in xim.dims]
         dims = [dim for dim in dims if dim not in ['c']] # remove channel dim
-    
+
     else:
         ndim = len(ldata.shape)
         dims = ['t', 'z', 'y', 'x'][-ndim:]
-    
+
     return dims
 
 
@@ -65,87 +67,108 @@ def set_msims_affine_transforms_from_viewer(viewer, msims, transform_key):
 
 
 def image_layer_to_msim(l, viewer):
-
     """
-    Convert a napari layer into a MultiscaleSpatialImage compatible with multiview-stitcher.
+    Convert a napari Image layer into a MultiscaleSpatialImage compatible
+    with multiview-stitcher.
+
+    Handles both single-scale and multiscale napari Image layers, and both
+    xarray.DataArray-backed and raw array (numpy/dask) data.
 
     Parameters
     ----------
     l : napari.layers.Image
-        l.data contains Union[array, xr.DataArray] for each scale
+        Napari image layer. l.data is a list of arrays/DataArrays for
+        multiscale layers, or a single array for single-scale layers.
+    viewer : napari.Viewer
+        Napari viewer instance.
 
     Returns
     -------
     MultiscaleSpatialImage
-        MultiscaleSpatialImage compatible with multiview-stitcher
+        MultiscaleSpatialImage compatible with multiview-stitcher.
     """
+    dims = get_layer_dims(l, viewer)
+    sdims = [dim for dim in dims if dim in ['x', 'y', 'z']]
 
-    if l.multiscale:
+    ch_name = _utils.get_layer_c_coord(l)
 
-        data_objects = {}
-        for isim, ldata in enumerate(l.data):
+    # Loading the layer from OME-Zarr directly
+    # if the layer was read using napari-ome-zarr.
+    # The benefit of this is that msims are backed
+    # by zarr arrays rather than dask arrays,
+    # which is more efficient for large datasets.
+    msim = _utils.try_load_msim_from_napari_ome_zarr(
+        l, viewer, dims, sdims, ch_name)
 
-            # convert to SpatialImage if necessary
-            if not isinstance(ldata, xr.DataArray):
-                # need to implement downsampling logic for this
-                raise(NotImplementedError('Multiscale layers with non-xarray data not supported yet.'))
-            else:
-                sdims = spatial_image_utils.get_spatial_dims_from_sim(ldata)
+    if msim is None and l.multiscale:
+        sims = []
+        # All levels cover the same physical region, so coarser levels have
+        # proportionally larger pixel sizes. Compute the per-level scale from
+        # the shape ratio between the finest (level 0) and each level.
+        finest_spatial_shape = np.array(l.data[0].shape[-len(sdims):], dtype=float)
+        for ldata in l.data:
+            level_spatial_shape = np.array(ldata.shape[-len(sdims):], dtype=float)
+            level_scale_factors = finest_spatial_shape / level_spatial_shape
 
-                ldata = ldata.assign_coords({'c': str(ldata.coords['c'].values)})
-
-                sim = to_spatial_image(
+            if isinstance(ldata, xr.DataArray):
+                # xarray-backed multiscale (e.g. from napari-aicsimageio)
+                xim_sdims = spatial_image_utils.get_spatial_dims_from_sim(ldata)
+                c_coord = _utils.get_layer_c_coord(l, ldata)
+                sim = spatial_image_utils.get_sim_from_array(
                     ldata,
-                    scale={dim: s for dim, s in zip(sdims, l.scale[-len(sdims):])},
-                    translation={dim: t for dim, t in zip(sdims, l.translate[-len(sdims):])},
-                    dims=ldata.dims,
+                    dims=list(ldata.dims),
+                    scale={dim: l.scale[-(len(xim_sdims) - j)] * level_scale_factors[j]
+                           for j, dim in enumerate(xim_sdims)},
+                    translation={dim: t for dim, t
+                                 in zip(xim_sdims, l.translate[-len(xim_sdims):])},
+                    c_coords=[c_coord],
                 )
+            else:
+                # Raw array (numpy/dask) multiscale
+                data = ldata if isinstance(ldata, da.Array) \
+                    else da.from_array(ldata)
+                sim = spatial_image_utils.get_sim_from_array(
+                    data,
+                    dims=dims,
+                    scale={dim: l.scale[-(len(sdims) - j)] * level_scale_factors[j]
+                           for j, dim in enumerate(sdims)},
+                    translation={dim: t for dim, t
+                                 in zip(sdims, l.translate[-len(sdims):])},
+                    c_coords=[ch_name],
+                )
+            sims.append(sim)
 
-            data_objects['scale%s' %isim] = sim.to_dataset(name='image', promote_attrs=True)
-        msim = xr.DataTree.from_dict(data_objects)
-        
-    else:
-        # use dimension labels from viewer if indicated
-        # consider that labels are set if x and y are present
+        # Build multiscale image from the individual resolution levels, then
+        # correct the per-level origins for the half-pixel offset introduced
+        # by downsampling (OME-Zarr v0.6 intrinsic coordinate convention).
+        msim = msi_utils.get_msim_from_sims(sims)
+        msim = msi_utils.correct_multiscale_origins(msim)
+
+    elif msim is None:
+        # Single-scale layer
         ldata = l.data
-        dims = get_layer_dims(l,viewer)
-
-        sdims = [dim for dim in dims if dim in ['x', 'y', 'z']]
-
-        if not 't' in dims:
-            dims = ['t'] + dims
-            ldata = ldata[np.newaxis]
-
-        # make sure to work with dask array
-        if isinstance(ldata, xr.DataArray):
-            data = ldata.data
-        else:
-            data = ldata
-
+        data = ldata.data if isinstance(ldata, xr.DataArray) else ldata
         if not isinstance(data, da.Array):
             data = da.from_array(data)
 
-        sim = to_spatial_image(
+        sim = spatial_image_utils.get_sim_from_array(
             data,
-            scale={dim: s for dim, s in zip(sdims, l.scale[-len(sdims):])},
-            translation={dim: t for dim, t in zip(sdims, l.translate[-len(sdims):])},
             dims=dims,
+            scale={dim: s for dim, s in zip(sdims, l.scale[-len(sdims):])},
+            translation={dim: t for dim, t
+                         in zip(sdims, l.translate[-len(sdims):])},
+            c_coords=[ch_name],
         )
+        msim = msi_utils.get_msim_from_sim(sim, scale_factors=[])
 
-        if len(l.name.split(' :: ')) > 1:
-            sim = sim.assign_coords(c=l.name.split(' :: ')[-1])
-        else:
-            sim = sim.assign_coords(c='default_channel')
-            
-        msim = to_multiscale(sim, scale_factors=[])
-        
-    ndim = spatial_image_utils.get_ndim_from_sim(msi_utils.get_sim_from_msim(msim))
+    # Store the napari layer's affine transform as the metadata transform
+    sim = msi_utils.get_sim_from_msim(msim)
+    ndim = spatial_image_utils.get_ndim_from_sim(sim)
     affine = np.array(l.affine.affine_matrix)[-(ndim+1):, -(ndim+1):]
-
     affine_xr = param_utils.affine_to_xaffine(affine, t_coords=sim.coords['t'])
     msi_utils.set_affine_transform(
         msim, affine_xr, transform_key='affine_metadata')
-    
+
     return msim
 
 
@@ -191,6 +214,26 @@ def create_image_layer_tuples_from_msim(
     ):
 
     """
+    Convert a MultiscaleSpatialImage into a list of napari layer data tuples.
+
+    If the msim has a channel dimension, one layer tuple is returned per channel.
+
+    Parameters
+    ----------
+    msim : MultiscaleSpatialImage
+    colormap : str, optional
+    name_prefix : str, optional
+    transform_key : str, optional
+        Which transform key to apply as the layer affine. None means identity.
+    ch_name : str, optional
+    contrast_limits : list of two floats, optional
+    blending : str, optional
+    data_as_array : bool, optional
+        If True, return raw dask arrays instead of SpatialImages for each scale.
+
+    Returns
+    -------
+    list of (data, kwargs, 'image') tuples
     """
 
     if 'c' in msi_utils.get_dims(msim):
@@ -207,16 +250,11 @@ def create_image_layer_tuples_from_msim(
                 blending=blending,
                 data_as_array=data_as_array,
                 )
-            
+
         return out_layers
 
     scale_keys = msi_utils.get_sorted_scale_keys(msim)
     ndim = spatial_image_utils.get_ndim_from_sim(msi_utils.get_sim_from_msim(msim))
-
-    if ndim == 3 and len(scale_keys) > 1:
-        warnings.warn('In 3D, theres a napari bug concerning scale/translate when using multiscale images. Using only a single resolution (the lowest).')
-        msim = msi_utils.get_msim_from_sim(msi_utils.get_sim_from_msim(msim, scale=scale_keys[-1]), scale_factors=[])
-        scale_keys = msi_utils.get_sorted_scale_keys(msim)
 
     sim = msi_utils.get_sim_from_msim(msim)
 
@@ -273,10 +311,6 @@ def create_image_layer_tuples_from_msim(
     kwargs = \
         {
         'contrast_limits': contrast_limits,
-        # 'contrast_limits': [np.iinfo(sim.dtype).min,
-        #                     np.iinfo(sim.dtype).max],
-        # 'contrast_limits': [np.iinfo(sim.dtype).min,
-        #                     30],
         'name': name,
         'colormap': colormap,
         'gamma': 0.6,
@@ -286,14 +320,12 @@ def create_image_layer_tuples_from_msim(
         'scale': np.array([spacing[dim] for dim in spatial_dims]),
         'cache': True,
         'blending': blending,
-        # 'multiscale': False,
         'multiscale': True,
         'metadata': {'full_affine_transform': affine_transform_xr}
         if transform_key is not None else None,
         }
 
     return [(multiscale_data, kwargs, 'image')]
-    # return [(multiscale_data[0], kwargs, 'image')]
 
 
 def create_image_layer_tuples_from_msims(
@@ -306,6 +338,26 @@ def create_image_layer_tuples_from_msims(
         ch_coord=None,
         data_as_array=False,
 ):
+    """
+    Convert a list of MultiscaleSpatialImages into napari layer data tuples.
+
+    Parameters
+    ----------
+    msims : list of MultiscaleSpatialImage
+    positional_cmaps : bool, optional
+        If True, assign greedy colors based on spatial overlap.
+    name_prefix : str, optional
+    n_colors : int, optional
+    transform_key : str, optional
+    contrast_limits : list, optional
+    ch_coord : optional
+        If given, select only this channel coordinate from each msim.
+    data_as_array : bool, optional
+
+    Returns
+    -------
+    list of (data, kwargs, 'image') tuples
+    """
 
     if positional_cmaps and len(msims) > 1:
         sims = [spatial_image_utils.get_sim_field(
@@ -328,7 +380,7 @@ def create_image_layer_tuples_from_msims(
             contrast_limits=contrast_limits,
             data_as_array=data_as_array,
             )
-    
+
     return out_layers
 
 
@@ -337,7 +389,7 @@ def set_layer_xaffine(l, xaffine, transform_key, base_transform_key=None):
         spatial_image_utils.set_sim_affine(
             sim,
             xaffine,
-            transform_key=transform_key, 
+            transform_key=transform_key,
             base_transform_key=base_transform_key)
     return
 
@@ -357,18 +409,16 @@ def manage_viewer_transformations_callback(event, viewer):
     except AttributeError:
         pass
 
-    # layers_to_manage = [l for l in viewer.layers if l.name in layer_names_to_manage]
-
     layers_to_manage = [l for l in viewer.layers
                         if 'napari_stitcher_manage_transformations' in l.metadata.keys()
                         and l.metadata['napari_stitcher_manage_transformations']]
-    
+
     if not len(layers_to_manage): return
-    
+
     # determine spatial dimensions from layers
     all_spatial_dims = [spatial_image_utils.get_spatial_dims_from_sim(
         l.data[0]) for l in layers_to_manage]
-    
+
     highest_sdim = max([len(sdim) for sdim in all_spatial_dims])
 
     # get curr tp
@@ -394,8 +444,6 @@ def manage_viewer_transformations_callback(event, viewer):
                 notifications.notification_manager.receive_info(
                     'Timepoint %s: no parameters available for tp' % curr_tp)
                 # if curr_tp not available, use nearest available parameter
-                # notifications.notification_manager.receive_info(
-                #     'Timepoint %s: no parameters available, taking nearest available one.' % curr_tp)
                 p = np.array(params.sel(t=layer_sim.coords['t'][curr_tp], method='nearest')).squeeze()
                 continue
         else:

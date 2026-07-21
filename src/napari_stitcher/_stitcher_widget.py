@@ -11,6 +11,11 @@ import os, tempfile, sys, shutil
 from collections.abc import Iterable
 
 import numpy as np
+import napari
+from packaging.version import Version
+
+# locked_data_level (the user-set level lock, None when Auto) was added in 0.7.1
+_NAPARI_HAS_LOCKED_DATA_LEVEL = Version(napari.__version__) >= Version('0.7.1')
 
 from napari.utils import notifications
 
@@ -24,6 +29,7 @@ from multiview_stitcher import (
     spatial_image_utils,
     msi_utils,
     param_utils,
+    misc_utils,
     )
 from napari.layers import Image, Labels
 
@@ -36,6 +42,7 @@ if TYPE_CHECKING:
 # define labels for visualization choices
 CHOICE_METADATA = 'Original'
 CHOICE_REGISTERED = 'Registered'
+DEFAULT_FUSION_N_JOBS = os.cpu_count() or 1
 
 
 class StitcherQWidget(QWidget):
@@ -121,6 +128,12 @@ class StitcherQWidget(QWidget):
         self.reg_method.changed.connect(self._on_reg_method_changed)
         self._on_reg_method_changed()
 
+        self.custom_reg_binning.changed.connect(self._on_custom_reg_binning_changed)
+        self._on_custom_reg_binning_changed()
+
+        self.do_quality_filter.changed.connect(self._on_do_quality_filter_changed)
+        self._on_do_quality_filter_changed()
+
         self.button_stitch = widgets.Button(text='Register',
             tooltip='Use the overlaps between tiles to determine their relative positions.')
         
@@ -144,6 +157,15 @@ class StitcherQWidget(QWidget):
                             self.load_layers_box,
                             ]
 
+        self.use_layer_resolution = widgets.CheckBox(
+            value=False,
+            text='Use chosen layer resolution',
+            tooltip='If checked and a multiscale layer has its resolution locked\n'
+                    '(not "Auto") in the napari layer controls, registration uses\n'
+                    'that locked level instead of letting the stitcher choose.\n'
+                    'Layers still showing "Auto" are unaffected.\n'
+                    'Requires napari >= 0.7.1.')
+
         self.reg_config_widgets_basic = [
                             self.times_slider,
                             self.reg_ch_picker,
@@ -156,6 +178,7 @@ class StitcherQWidget(QWidget):
                             self.do_quality_filter,
                             self.quality_threshold,
                             self.pair_pruning_method,
+                            self.use_layer_resolution,
         ]
 
         self.reg_config_widgets_method = [
@@ -165,17 +188,53 @@ class StitcherQWidget(QWidget):
 
         self.reg_config_widgets = self.reg_config_widgets_basic + self.reg_config_widgets_advanced + self.reg_config_widgets_method
 
-        # Initialize tab screen 
-        self.reg_config_widgets_tabs = QTabWidget() 
-        self.reg_config_widgets_tabs.resize(300, 200) 
-   
-        # Add tabs 
+        # Registration sub-tabs (Basic / More / Method)
+        self.reg_config_widgets_tabs = QTabWidget()
+        self.reg_config_widgets_tabs.resize(300, 200)
         self.reg_config_widgets_tabs.addTab(
-            widgets.VBox(widgets=self.reg_config_widgets_basic).native, "Basic") 
+            widgets.VBox(widgets=self.reg_config_widgets_basic).native, "Basic")
         self.reg_config_widgets_tabs.addTab(
             widgets.VBox(widgets=self.reg_config_widgets_advanced).native, "More")
         self.reg_config_widgets_tabs.addTab(
             widgets.VBox(widgets=self.reg_config_widgets_method).native, "Method")
+
+        # Fusion settings
+        self.precompute_fusion = widgets.CheckBox(
+            value=True,
+            text='Pre-compute fusion',
+            tooltip='If checked, fusion is computed eagerly and written to a\n'
+                    '(OME-)Zarr store. The resulting napari layer is\n'
+                    'backed by that store.\n'
+                    'If unchecked, the fused image is a lazy dask array (no\n'
+                    'computation until the layer is first rendered).')
+        self.precompute_fusion_path = widgets.FileEdit(
+            mode='d',
+            value=None,
+            nullable=True,
+            label='Fusion OME-Zarr path:',
+            tooltip='Optional top-level path for the pre-computed fusion zarr store.\n'
+                    'Leave empty to use a temporary store.')
+        self.precompute_fusion_n_jobs = widgets.SpinBox(
+            value=DEFAULT_FUSION_N_JOBS,
+            min=1,
+            max=DEFAULT_FUSION_N_JOBS,
+            label='Fusion jobs:',
+            tooltip='Number of local joblib jobs to use for pre-computed fusion.\n'
+                    'The default is the number of detected CPU cores.')
+        self.precompute_fusion.changed.connect(
+            self._on_precompute_fusion_changed)
+        self._on_precompute_fusion_changed()
+        self.fusion_config_widgets = [
+            self.precompute_fusion,
+            self.precompute_fusion_path,
+            self.precompute_fusion_n_jobs,
+        ]
+
+        # Top-level settings tabs: Registration and Fusion
+        self.settings_tabs = QTabWidget()
+        self.settings_tabs.addTab(self.reg_config_widgets_tabs, "Registration")
+        self.settings_tabs.addTab(
+            widgets.VBox(widgets=self.fusion_config_widgets).native, "Fusion")
 
         self.visualization_widgets = [
                             self.visualization_type_rbuttons,
@@ -184,6 +243,7 @@ class StitcherQWidget(QWidget):
         self.all_widgets = \
             self.loading_widgets +\
             self.reg_config_widgets +\
+            self.fusion_config_widgets +\
             [self.button_stitch] +\
             [self.button_fuse] +\
             self.visualization_widgets
@@ -197,7 +257,7 @@ class StitcherQWidget(QWidget):
             else:
                 self.container.layout().addWidget(w)
 
-        self.container.layout().addWidget(self.reg_config_widgets_tabs)
+        self.container.layout().addWidget(self.settings_tabs)
         self.container.layout().addWidget(self.button_stitch.native)
         self.container.layout().addWidget(self.button_fuse.native)
 
@@ -213,8 +273,8 @@ class StitcherQWidget(QWidget):
         self.layout().addWidget(self.container)
 
         # disable all widgets (apart from loading) until layers are loaded
-        for w in self.reg_config_widgets + self.visualization_widgets +\
-            [self.button_stitch, self.button_fuse]:
+        for w in self.reg_config_widgets + self.fusion_config_widgets + \
+                self.visualization_widgets + [self.button_stitch, self.button_fuse]:
             w.enabled = False
             if isinstance(w, Iterable):
                 for sw in w:
@@ -249,6 +309,79 @@ class StitcherQWidget(QWidget):
     def _on_reg_method_changed(self, event=None):
         """Show/hide transform type widget based on the selected method."""
         self.antspy_transform_types.visible = self.reg_method.value == 'ITKElastix'
+
+    def _on_custom_reg_binning_changed(self, event=None):
+        """Enable binning sliders only when custom binning is ticked."""
+        on = self.custom_reg_binning.value and self.custom_reg_binning.enabled
+        self.x_reg_binning.enabled = on
+        self.y_reg_binning.enabled = on
+
+    def _on_do_quality_filter_changed(self, event=None):
+        """Enable quality threshold only when quality filtering is ticked."""
+        self.quality_threshold.enabled = (
+            self.do_quality_filter.value and self.do_quality_filter.enabled)
+
+    def _on_precompute_fusion_changed(self, event=None):
+        """Enable pre-compute-only fusion controls when pre-compute is active."""
+        enabled = self.precompute_fusion.value and self.precompute_fusion.enabled
+        self.precompute_fusion_path.enabled = enabled
+        self.precompute_fusion_n_jobs.enabled = enabled
+
+    def _get_precompute_fusion_path(self, channel, n_channels):
+        """
+        Return the top-level zarr path for a pre-computed fusion result.
+
+        An empty picker value keeps the existing behavior and writes one store
+        per channel to the widget-owned temporary directory.  A user-selected
+        path is used exactly for single-channel fusion.  For multi-channel
+        fusion, this widget still writes one store per channel, so a channel
+        suffix is inserted to avoid overwriting earlier channels.
+        """
+        output_path = self.precompute_fusion_path.value
+        if output_path is None:
+            return os.path.join(self.tmpdir.name, 'fused_%s.zarr' % channel)
+
+        output_path = os.fspath(output_path)
+        if n_channels > 1:
+            output_path = self._append_channel_to_path(output_path, channel)
+
+        parent_dir = os.path.dirname(output_path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        return output_path
+
+    @staticmethod
+    def _append_channel_to_path(path, channel):
+        """Insert a channel suffix before the zarr extension in ``path``."""
+        parent_dir, filename = os.path.split(path)
+        channel_suffix = '_%s' % channel
+
+        for extension in ('.ome.zarr', '.zarr'):
+            if filename.endswith(extension):
+                filename = (
+                    filename[:-len(extension)] + channel_suffix + extension)
+                return os.path.join(parent_dir, filename)
+
+        stem, extension = os.path.splitext(filename)
+        filename = stem + channel_suffix + extension
+        return os.path.join(parent_dir, filename)
+
+    def _get_precompute_fusion_batch_options(self):
+        """
+        Return joblib batch options for direct-to-Zarr fusion.
+
+        multiview-stitcher processes direct Zarr output in block batches.  The
+        joblib batch function parallelizes blocks inside each batch, and a batch
+        size of ``5 * n_jobs`` keeps several blocks queued per worker.
+        """
+        n_jobs = int(self.precompute_fusion_n_jobs.value)
+        return {
+            'batch_func': misc_utils.process_batch_using_joblib,
+            'n_batch': 5 * n_jobs,
+            'batch_func_kwargs': {
+                'n_jobs': n_jobs,
+            },
+        }
 
     def update_viewer_transformations(self, event=None):
         """
@@ -448,6 +581,35 @@ class StitcherQWidget(QWidget):
                                          self.times_slider.value[1] + 1)]})
                   for msim in msims]
 
+        # Optionally collapse each msim to the resolution level the user has
+        # locked in the napari layer controls (locked_data_level).  Layers
+        # showing "Auto" (locked_data_level is None) are passed through
+        # unchanged.  The full msims in self.msims are unmodified; params are
+        # applied to them after registration.
+        if self.use_layer_resolution.value and _NAPARI_HAS_LOCKED_DATA_LEVEL:
+            view_to_layer = {
+                _utils.get_str_unique_to_view_from_layer_name(l.name): l
+                for l in self.input_layers if l.name in self.msims
+            }
+            reg_msims = []
+            for lname, msim in zip(sorted_lnames, msims):
+                l = view_to_layer.get(lname)
+                scale_keys = msi_utils.get_sorted_scale_keys(msim)
+                locked = getattr(l, 'locked_data_level', None) if l is not None else None
+                if l is not None and l.multiscale and len(scale_keys) > 1 and locked is not None:
+                    level = min(locked, len(scale_keys) - 1)
+                    sim = msi_utils.get_sim_from_msim(msim, scale=scale_keys[level])
+                    reg_msim = msi_utils.get_msim_from_sim(sim, scale_factors=[])
+                    msi_utils.set_affine_transform(
+                        reg_msim,
+                        msi_utils.get_transform_from_msim(msim, transform_key='affine_metadata'),
+                        transform_key='affine_metadata')
+                else:
+                    reg_msim = msim
+                reg_msims.append(reg_msim)
+        else:
+            reg_msims = msims
+
         # with _utils.TemporarilyDisabledWidgets([self.container]),\
         with _utils.TemporarilyDisabledWidgets(self.all_widgets),\
             _utils.VisibleActivityDock(self.viewer),\
@@ -470,7 +632,8 @@ class StitcherQWidget(QWidget):
                 groupwise_resolution_kwargs = None
 
             params = registration.register(
-                msims,
+                reg_msims,
+                reg_channel=self.reg_ch_picker.value,
                 registration_binning=registration_binning,
                 pairwise_reg_func=pairwise_reg_func,
                 pairwise_reg_func_kwargs=pairwise_reg_func_kwargs,
@@ -508,6 +671,16 @@ class StitcherQWidget(QWidget):
 
         """
         Split layers into channel groups and fuse each group separately.
+
+        If all input napari layers are multiscale, the fused result is a
+        multiscale napari layer; otherwise it is a plain single-scale layer.
+
+        When "Pre-compute fusion" is enabled (default), the result is written
+        to an (OME-)Zarr store before creating the layer, so the data is fully
+        on disk and rendering is fast.  With no user-selected path, that store
+        lives in a temporary directory.  When disabled, fusion.fuse returns a
+        lazy dask graph and no disk write occurs; computation is deferred until
+        the layer is first rendered.
         """
 
         # Capture manual layer adjustments if fusing with original transforms
@@ -519,55 +692,73 @@ class StitcherQWidget(QWidget):
 
         for _, ch in enumerate(channels):
 
-            msims = [msim for _, msim in self.msims.items()
-                    if ch in msi_utils.get_sim_from_msim(msim).coords['c']]
+            # Select msims for the current channel
+            ch_msims = [msim for _, msim in self.msims.items()
+                        if ch in msi_utils.get_sim_from_msim(msim).coords['c']]
 
-            sims = [msi_utils.get_sim_from_msim(msim) for msim in msims]
+            # Select the requested timepoints at the msim level
+            ch_msims = [msi_utils.multiscale_sel_coords(msim,
+                        {'t': [msi_utils.get_sim_from_msim(msim).coords['t'][it]
+                                for it in range(self.times_slider.value[0] + 1,
+                                                self.times_slider.value[1] + 1)]})
+                        for msim in ch_msims]
 
-            sims = [spatial_image_utils.sim_sel_coords(sim,
-                    {'t': [sim.coords['t'][it]
-                            for it in range(self.times_slider.value[0] + 1,
-                                            self.times_slider.value[1] + 1)]})
-                    for sim in sims]
+            transform_key = ('affine_registered'
+                             if self.visualization_type_rbuttons.value == CHOICE_REGISTERED
+                             else 'affine_metadata')
 
-            fused = fusion.fuse(
-                sims,
-                transform_key='affine_registered'
-                if self.visualization_type_rbuttons.value == CHOICE_REGISTERED
-                else 'affine_metadata',
-            )
+            if self.precompute_fusion.value:
+                # Eager: write fused result to (OME-)Zarr before creating the layer.
+                # All-multiscale inputs → OME-Zarr pyramid; otherwise plain zarr
+                # (fusion.fuse selects only the finest resolution, which is cheaper).
+                fused_path = self._get_precompute_fusion_path(
+                    ch, n_channels=len(channels))
+                if os.path.exists(fused_path):
+                    shutil.rmtree(fused_path)
+                zarr_options = {'ome_zarr': True} if self.all_layers_multiscale else {}
 
-            fused = fused.expand_dims({'c': [sims[0].coords['c'].values]})
+                with _utils.TemporarilyDisabledWidgets(self.all_widgets),\
+                    _utils.VisibleActivityDock(self.viewer),\
+                    _utils.TqdmCallback(tqdm_class=_utils.progress,
+                                        desc='Fusing tiles of channel %s' % ch, bar_format=" "):
+                    mfused = fusion.fuse(
+                        images=ch_msims,
+                        transform_key=transform_key,
+                        output_zarr_url=fused_path,
+                        zarr_options=zarr_options,
+                        batch_options=(
+                            self._get_precompute_fusion_batch_options()),
+                    )
+            else:
+                # Lazy: return a dask-backed msim with no disk write.
+                # Computation is deferred until the layer is first rendered.
+                mfused = fusion.fuse(images=ch_msims, transform_key=transform_key)
 
-            mfused = msi_utils.get_msim_from_sim(fused, scale_factors=[])
-
-            tmp_fused_path = os.path.join(self.tmpdir.name, 'fused_%s.zarr' %ch)
-            if os.path.exists(tmp_fused_path):
-                shutil.rmtree(tmp_fused_path)
-
-            with _utils.TemporarilyDisabledWidgets(self.all_widgets),\
-                _utils.VisibleActivityDock(self.viewer),\
-                _utils.TqdmCallback(tqdm_class=_utils.progress,
-                                    desc='Fusing tiles of channel %s' %ch, bar_format=" "):
-                
-                mfused.to_zarr(tmp_fused_path)
-
-            mfused = msi_utils.multiscale_spatial_image_from_zarr(tmp_fused_path, chunks={})
-
-            fused_ch_layer_tuple = viewer_utils.create_image_layer_tuples_from_msim(
+            fused_data, fused_kwargs, _ = viewer_utils.create_image_layer_tuples_from_msim(
                 mfused,
                 colormap=None,
                 name_prefix='fused',
             )[0]
 
-            fused_layer = self.viewer.add_image(fused_ch_layer_tuple[0], **fused_ch_layer_tuple[1])
-        
+            if not self.all_layers_multiscale:
+                # Non-multiscale inputs → plain (non-multiscale) output layer.
+                # Squeeze non-spatial size-1 dims (t=1, c=1) so the array shape
+                # matches the spatial-only scale/translate in fused_kwargs.
+                sim = fused_data[0]
+                sdims = spatial_image_utils.get_spatial_dims_from_sim(sim)
+                squeeze_dims = [d for d in sim.dims if d not in sdims and sim.sizes[d] == 1]
+                fused_data = sim.squeeze(dim=squeeze_dims).data
+                fused_kwargs = {**fused_kwargs, 'multiscale': False}
+
+            fused_layer = self.viewer.add_image(fused_data, **fused_kwargs)
+
             self.fused_layers.append(fused_layer)
 
 
     def reset(self):
             
         self.msims = {}
+        self.all_layers_multiscale = True
         self.params = dict()
         self.reg_ch_picker.choices = ()
         self.visualization_type_rbuttons.value = CHOICE_METADATA
@@ -594,11 +785,18 @@ class StitcherQWidget(QWidget):
                 for l_name, msim in self.msims.items()])
             self.reg_ch_picker.value = self.reg_ch_picker.choices[0]
 
-        for w in self.reg_config_widgets + [self.button_stitch, self.button_fuse]:
+        for w in self.reg_config_widgets + self.fusion_config_widgets + [self.button_stitch, self.button_fuse]:
             if isinstance(w, Iterable):
                 for sw in w:
                     sw.enabled = True
             w.enabled = True
+
+        # Re-apply conditional enable states that the bulk loop would override
+        self._on_custom_reg_binning_changed()
+        self._on_do_quality_filter_changed()
+        self._on_precompute_fusion_changed()
+        if not _NAPARI_HAS_LOCKED_DATA_LEVEL:
+            self.use_layer_resolution.enabled = False
 
 
     def load_layers_all(self):
@@ -644,7 +842,8 @@ class StitcherQWidget(QWidget):
         for l in self.input_layers:
             msim = viewer_utils.image_layer_to_msim(l, self.viewer)
             
-            if 'c' in msim['scale0/image'].dims:
+            # Reject layers with more than one channel ('c' is always a dim now)
+            if msim['scale0/image'].sizes.get('c', 1) > 1:
                 notifications.notification_manager.receive_info(
                     "Layer '%s' has more than one channel. Consider splitting the stack (right click on layer -> 'Split Stack')." %l.name
                 )
@@ -654,6 +853,9 @@ class StitcherQWidget(QWidget):
             
             msim = msi_utils.ensure_dim(msim, 't')
             self.msims[l.name] = msim
+
+        # Track whether all input layers are multiscale to decide fusion output type
+        self.all_layers_multiscale = all(l.multiscale for l in self.input_layers)
 
         sims = [msi_utils.get_sim_from_msim(msim) for l.name, msim in self.msims.items()]
 
@@ -766,4 +968,3 @@ if __name__ == "__main__":
     
     wdg = StitcherQWidget(viewer)
     viewer.window.add_dock_widget(wdg)
-
