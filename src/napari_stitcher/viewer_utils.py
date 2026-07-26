@@ -388,7 +388,7 @@ def create_image_layer_tuples_from_msims(
     return out_layers
 
 
-def create_shape_layer_tuples_from_msim(
+def create_shape_layer_tuples_from_msims(
     msims,
     transform_key,
     colormaps=None,

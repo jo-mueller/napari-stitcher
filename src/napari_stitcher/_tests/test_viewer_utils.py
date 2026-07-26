@@ -179,7 +179,7 @@ def test_create_image_layer_tuples_from_msims(ndim, N_c, N_t, make_napari_viewer
 
 
 @pytest.mark.parametrize("ndim", [2, 3])
-def test_create_shape_layer_tuples_from_msim(ndim, monkeypatch):
+def test_create_shape_layer_tuples_from_msims(ndim, monkeypatch):
     spatial_dims = ["z", "y", "x"][-ndim:]
     spatial_shape = (2, 3, 4)[-ndim:]
     scale = dict(zip(spatial_dims, (2.0, 3.0, 4.0)[-ndim:]))
@@ -206,7 +206,7 @@ def test_create_shape_layer_tuples_from_msim(ndim, monkeypatch):
         transform_key=transform_key,
     )
 
-    layer_tuples = viewer_utils.create_shape_layer_tuples_from_msim(
+    layer_tuples = viewer_utils.create_shape_layer_tuples_from_msims(
         [msim, msim],
         transform_key=transform_key,
         colormaps=["red", "green"],
@@ -257,7 +257,7 @@ def test_create_shape_layer_tuples_from_msim(ndim, monkeypatch):
         "get_greedy_colors",
         get_greedy_colors,
     )
-    positional_tuples = viewer_utils.create_shape_layer_tuples_from_msim(
+    positional_tuples = viewer_utils.create_shape_layer_tuples_from_msims(
         [msim, msim],
         transform_key=transform_key,
         n_colors=2,
@@ -269,7 +269,7 @@ def test_create_shape_layer_tuples_from_msim(ndim, monkeypatch):
     assert positional_tuples[0][1]["edge_color"] == "#E69F00"
     assert positional_tuples[1][1]["edge_color"] == "#56B4E9"
 
-    black_tuples = viewer_utils.create_shape_layer_tuples_from_msim(
+    black_tuples = viewer_utils.create_shape_layer_tuples_from_msims(
         [msim, msim],
         transform_key=transform_key,
         use_positional_colors=False,
@@ -279,7 +279,7 @@ def test_create_shape_layer_tuples_from_msim(ndim, monkeypatch):
     )
 
     with pytest.raises(ValueError, match="one colormap per msim"):
-        viewer_utils.create_shape_layer_tuples_from_msim(
+        viewer_utils.create_shape_layer_tuples_from_msims(
             [msim, msim],
             transform_key=transform_key,
             colormaps=["red"],
