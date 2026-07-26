@@ -6,6 +6,7 @@ import dask.array as da
 from multiview_stitcher.io import METADATA_TRANSFORM_KEY
 from multiview_stitcher import (
     msi_utils,
+    param_utils,
     sample_data,
     registration,
     fusion,
@@ -14,6 +15,7 @@ from multiview_stitcher import (
 )
 import pytest
 
+from napari.layers import Shapes
 from napari_stitcher import viewer_utils, _utils
 
 
@@ -174,3 +176,111 @@ def test_create_image_layer_tuples_from_msims(ndim, N_c, N_t, make_napari_viewer
         current_step = list(viewer.dims.current_step)
         current_step[0] = current_step[0] + 1
         viewer.dims.current_step = tuple(current_step)
+
+
+@pytest.mark.parametrize("ndim", [2, 3])
+def test_create_shape_layer_tuples_from_msim(ndim, monkeypatch):
+    spatial_dims = ["z", "y", "x"][-ndim:]
+    spatial_shape = (2, 3, 4)[-ndim:]
+    scale = dict(zip(spatial_dims, (2.0, 3.0, 4.0)[-ndim:]))
+    translation = dict(zip(spatial_dims, (5.0, 6.0, 7.0)[-ndim:]))
+
+    sim = spatial_image_utils.get_sim_from_array(
+        da.zeros(spatial_shape),
+        dims=spatial_dims,
+        scale=scale,
+        translation=translation,
+    )
+    msim = msi_utils.get_msim_from_sim(sim, scale_factors=[])
+
+    # Include off-diagonal terms so the test covers the full affine rather
+    # than translation alone.
+    affine = np.eye(ndim + 1)
+    affine[0, 1] = 0.25
+    affine[1, 0] = -0.5
+    affine[:-1, -1] = np.arange(ndim) + 10
+    transform_key = "affine_test"
+    msi_utils.set_affine_transform(
+        msim,
+        param_utils.affine_to_xaffine(affine),
+        transform_key=transform_key,
+    )
+
+    layer_tuples = viewer_utils.create_shape_layer_tuples_from_msim(
+        [msim, msim],
+        transform_key=transform_key,
+        colormaps=["red", "green"],
+        name_prefix="tile_bounds",
+        shape_kwargs={"edge_width": 3, "opacity": 0.5},
+    )
+
+    assert len(layer_tuples) == 2
+    lines, kwargs, layer_type = layer_tuples[0]
+    _, second_kwargs, _ = layer_tuples[1]
+    assert layer_type == "shapes"
+    assert kwargs["shape_type"] == "line"
+    assert kwargs["name"] == "tile_bounds_000"
+    assert kwargs["edge_width"] == 3
+    assert kwargs["opacity"] == 0.5
+    assert second_kwargs["name"] == "tile_bounds_001"
+    np.testing.assert_allclose(kwargs["edge_color"], [1, 0, 0, 1])
+    np.testing.assert_allclose(second_kwargs["edge_color"], [0, 1, 0, 1])
+    assert len(lines) == (4 if ndim == 2 else 12)
+
+    corner_indices = np.array(list(np.ndindex(tuple([2] * ndim))))
+    origin = np.array([translation[dim] for dim in spatial_dims])
+    spacing = np.array([scale[dim] for dim in spatial_dims])
+    corners = corner_indices * (np.array(spatial_shape) - 1) * spacing + origin
+    transformed_corners = (
+        affine @ np.column_stack([corners, np.ones(len(corners))]).T
+    ).T[:, :-1]
+    expected_lines = [
+        transformed_corners[[i, j]]
+        for i in range(len(corner_indices))
+        for j in range(i + 1, len(corner_indices))
+        if np.sum(np.abs(corner_indices[i] - corner_indices[j])) == 1
+    ]
+    np.testing.assert_allclose(lines, expected_lines)
+
+    # Confirm that the returned LayerDataTuple kwargs are accepted by napari.
+    layer = Shapes(lines, **kwargs)
+    assert len(layer.data) == len(expected_lines)
+
+    positional_color_calls = []
+
+    def get_greedy_colors(sims, n_colors, transform_key):
+        positional_color_calls.append((sims, n_colors, transform_key))
+        return {0: 0, 1: 1}
+
+    monkeypatch.setattr(
+        viewer_utils.mv_graph,
+        "get_greedy_colors",
+        get_greedy_colors,
+    )
+    positional_tuples = viewer_utils.create_shape_layer_tuples_from_msim(
+        [msim, msim],
+        transform_key=transform_key,
+        n_colors=2,
+    )
+    assert len(positional_color_calls) == 1
+    _, called_n_colors, called_transform_key = positional_color_calls[0]
+    assert called_n_colors == 2
+    assert called_transform_key == transform_key
+    assert positional_tuples[0][1]["edge_color"] == "#E69F00"
+    assert positional_tuples[1][1]["edge_color"] == "#56B4E9"
+
+    black_tuples = viewer_utils.create_shape_layer_tuples_from_msim(
+        [msim, msim],
+        transform_key=transform_key,
+        use_positional_colors=False,
+    )
+    assert all(
+        kwargs["edge_color"] == "black" for _, kwargs, _ in black_tuples
+    )
+
+    with pytest.raises(ValueError, match="one colormap per msim"):
+        viewer_utils.create_shape_layer_tuples_from_msim(
+            [msim, msim],
+            transform_key=transform_key,
+            colormaps=["red"],
+        )

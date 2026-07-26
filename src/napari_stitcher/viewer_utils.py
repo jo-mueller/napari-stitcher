@@ -9,12 +9,14 @@ from multiview_stitcher import (
     spatial_image_utils,
     msi_utils,
     param_utils,
+    vis_utils,
 )
 
 from . import _utils
 
 from napari.experimental import link_layers
 from napari.utils import notifications
+from napari.utils.colormaps import ensure_colormap
 
 
 def get_layer_dims(l, viewer):
@@ -97,8 +99,10 @@ def image_layer_to_msim(l, viewer):
     # The benefit of this is that msims are backed
     # by zarr arrays rather than dask arrays,
     # which is more efficient for large datasets.
-    msim = _utils.try_load_msim_from_napari_ome_zarr(
-        l, viewer, dims, sdims, ch_name)
+    # msim = _utils.try_load_msim_from_napari_ome_zarr(
+    #     l, viewer, dims, sdims, ch_name)
+    # deactivate for now
+    msim = None
 
     if msim is None and l.multiscale:
         sims = []
@@ -380,6 +384,111 @@ def create_image_layer_tuples_from_msims(
             contrast_limits=contrast_limits,
             data_as_array=data_as_array,
             )
+
+    return out_layers
+
+
+def create_shape_layer_tuples_from_msim(
+    msims,
+    transform_key,
+    colormaps=None,
+    name_prefix=None,
+    use_positional_colors=True,
+    n_colors=2,
+    shape_kwargs=None,
+):
+    """
+    Create napari Shapes layer tuples showing the bounds of each msim.
+
+    Each bounding box is represented by four lines in 2D or twelve lines in
+    3D. The line vertices are returned in world coordinates after applying the
+    requested affine transform, including rotation and shear.
+
+    Parameters
+    ----------
+    msims : list of MultiscaleSpatialImage
+    transform_key : str
+        Transform used to position each bounding box in world coordinates.
+    colormaps : sequence of napari-compatible colormaps, optional
+        One colormap per msim. Each colormap is sampled at its maximum value
+        to obtain the corresponding shape layer's edge color.
+    name_prefix : str, optional
+        Prefix for layer names. By default, ``"bounding_box"`` is used.
+    use_positional_colors : bool, optional
+        When no colormaps are given, color overlapping msims differently using
+        the same greedy coloring as ``vis_utils.plot_positions``.
+    n_colors : int, optional
+        Number of positional colors to use, by default 2.
+    shape_kwargs : dict, optional
+        Additional keyword arguments for each napari Shapes layer. These
+        values override generated defaults such as ``name`` or ``edge_color``.
+
+    Returns
+    -------
+    list of (data, kwargs, 'shapes') tuples
+    """
+
+    if not msims:
+        return []
+
+    if colormaps is not None:
+        if len(colormaps) != len(msims):
+            raise ValueError("colormaps must contain one colormap per msim")
+        edge_colors = [ensure_colormap(cmap).map([1])[0] for cmap in colormaps]
+    elif use_positional_colors:
+        sims = [
+            spatial_image_utils.get_sim_field(
+                msi_utils.get_sim_from_msim(msim)
+            )
+            for msim in msims
+        ]
+        greedy_colors = mv_graph.get_greedy_colors(
+            sims,
+            n_colors=n_colors,
+            transform_key=transform_key,
+        )
+        edge_colors = [
+            vis_utils._POSITIONAL_COLOR_PALETTE[
+                greedy_colors[iview] % len(vis_utils._POSITIONAL_COLOR_PALETTE)
+            ]
+            for iview in range(len(msims))
+        ]
+    else:
+        edge_colors = ["black"] * len(msims)
+
+    layer_name_prefix = "bounding_box" if name_prefix is None else name_prefix
+    out_layers = []
+
+    for iview, (msim, edge_color) in enumerate(zip(msims, edge_colors)):
+        sim = msi_utils.get_sim_from_msim(msim)
+        stack_props = spatial_image_utils.get_stack_properties_from_sim(
+            sim, transform_key=transform_key
+        )
+
+        # This applies the complete affine to every corner. Transforming the
+        # corners (instead of only translating the layer) preserves rotated
+        # and sheared bounding boxes.
+        vertices = mv_graph.get_vertices_from_stack_props(stack_props)
+        ndim = vertices.shape[1]
+        grid_vertices = np.array(list(np.ndindex(tuple([2] * ndim))))
+        edge_pairs = [
+            (i, j)
+            for i in range(len(grid_vertices))
+            for j in range(i + 1, len(grid_vertices))
+            if np.sum(np.abs(grid_vertices[i] - grid_vertices[j])) == 1
+        ]
+        lines = [vertices[[start, end]] for start, end in edge_pairs]
+
+        kwargs = {
+            "shape_type": "line",
+            "name": f"{layer_name_prefix}_{iview:03d}",
+        }
+        if edge_color is not None:
+            kwargs["edge_color"] = edge_color
+        if shape_kwargs is not None:
+            kwargs.update(shape_kwargs)
+
+        out_layers.append((lines, kwargs, "shapes"))
 
     return out_layers
 
